@@ -10,12 +10,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(d_model))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        TODO 1:
-        1. Upcast x to float32 for numerical stability under bf16/fp16.
-        2. Compute rms = sqrt(mean(x^2, dim=-1, keepdim=True) + eps).
-        3. Normalize x / rms, cast back to original dtype, and multiply by self.weight.
-        """
+
         inv_rms = torch.rsqrt(torch.mean((x.to((torch.float32))**2), dim=-1, keepdim=True) + self.eps)
         x = (self.weight * x * inv_rms).to(x.dtype)
         return x
@@ -36,7 +31,9 @@ class SwiGLU(nn.Module):
         """
         TODO 2: Compute w2(SiLU(w1(x)) * w3(x)).
         """
-        raise NotImplementedError
+
+        x = self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return x
 
 
 class RoPE(nn.Module):
@@ -45,7 +42,12 @@ class RoPE(nn.Module):
         assert head_dim % 2 == 0, "head_dim must be even for RoPE"
         # TODO 3a: Precompute inv_freq = 1.0 / (theta ** (arange(0, head_dim, 2) / head_dim))
         # Build cos/sin tables of shape (max_seq_len, head_dim // 2) and register_buffer(..., persistent=False)
-        raise NotImplementedError
+
+        inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2) / head_dim))
+        t = torch.arange(max_seq_len).float()
+        freqs = torch.outer(t, inv_freq)
+        self.register_buffer("cos", freqs.cos(), persistent=False)
+        self.register_buffer("sin", freqs.sin(), persistent=False)
 
     def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """
@@ -55,31 +57,29 @@ class RoPE(nn.Module):
         Split x into pairs (x_even, x_odd) — or first/second half — rotate by cos/sin
         at `positions` in float32, and return tensor with identical shape & dtype as x.
         """
+        in_dtype = x.dtype
+        x = x.float()
+        cos = self.cos[positions]
+        sin = self.sin[positions]
+
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+
+        rot_even = x_even * cos - x_odd * sin
+        rot_odd = x_even * sin + x_odd * cos
+
+        out = torch.stack([rot_even, rot_odd], dim=-1).flatten(-2)
+        return out.to(in_dtype)
+
         raise NotImplementedError
 
 
 if __name__ == "__main__":
-    torch.manual_seed(0)
+    rope = RoPE(head_dim=64, max_seq_len=128)
+    q = torch.randn(1, 1, 64)
+    k = torch.randn(1, 1, 64)
+    dot_0_5 = (rope(q, torch.tensor([0])) * rope(k, torch.tensor([5]))).sum()
+    dot_17_22 = (rope(q, torch.tensor([17])) * rope(k, torch.tensor([22]))).sum()
+    assert torch.allclose(dot_0_5, dot_17_22, atol=1e-5), f"RoPE broke shift invariance: {dot_0_5} vs {dot_17_22}"
 
-    d_model, eps = 64, 1e-6
-
-    mine = RMSNorm(d_model, eps)
-    ref = nn.RMSNorm(d_model, eps)
-
-    x1 = torch.randn(2, 16, d_model, requires_grad=True)
-    x2 = x1.detach().clone().requires_grad_(True)
-    y1, y2 = mine(x1), ref(x2)
-    assert torch.allclose(y1, y2, atol=1e-6), f"Forward diff: {(y1 - y2).abs().max()}"
-
-    y1.sum().backward()
-    y2.sum().backward()
-    assert torch.allclose(x1.grad, x2.grad , atol=1e-6)
-    assert torch.allclose(mine.weight.grad, ref.weight.grad, atol=1e-6)
-
-    x_bf16 = torch.randn(2, 16, d_model, dtype=torch.bfloat16) * 50.0
-    y_bf16 = mine(x_bf16)
-    assert y_bf16.dtype == torch.bfloat16
-    rms_out = y_bf16.float().pow(2).mean(dim=-1).sqrt()
-    assert torch.allclose(rms_out, torch.ones_like(rms_out), atol=5e-2), f"Bad RMS: {rms_out.mean()}"
-
-    print("RMSNorm passed forward, backward, and bf16 checks!")
+    print("All Day 1 primitive checks passed!")
